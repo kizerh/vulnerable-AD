@@ -110,49 +110,73 @@ function VulnAD-BadAcls {
     }
     for ($i=1; $i -le (Get-Random -Maximum 25); $i=$i+1 ) {
         $abuse = (VulnAD-GetRandom -InputList $Global:BadACL);
-        $randomuser = VulnAD-GetRandom -InputList $Global:CreatedUsers
-        $randomgroup = VulnAD-GetRandom -InputList $Global:AllObjects
-        if ((Get-Random -Maximum 2)){
-            $Dstobj = Get-ADUser -Identity $randomuser
-            $Srcobj = Get-ADGroup -Identity $randomgroup
-        }else{
-            $Srcobj = Get-ADUser -Identity $randomuser
-            $Dstobj = Get-ADGroup -Identity $randomgroup
-        }
-        VulnAD-AddACL -Source $Srcobj.sid -Destination $Dstobj.DistinguishedName -Rights $abuse 
-        Write-Info "BadACL $abuse $randomuser and $randomgroup"
-    }
-}
 function VulnAD-Kerberoasting {
-    $selected_service = (VulnAD-GetRandom -InputList $Global:ServicesAccountsAndSPNs)
-    $svc = $selected_service.split(',')[0];
-    $spn = $selected_service.split(',')[1];
-    $password = VulnAD-GetRandom -InputList $Global:BadPasswords;
-    Write-Info "Kerberoasting $svc $spn"
-    Try { New-ADServiceAccount -Name $svc -ServicePrincipalNames "$svc/$spn.$Global:Domain" -AccountPassword (ConvertTo-SecureString $password -AsPlainText -Force) -RestrictToSingleComputer -PassThru } Catch {}
-    foreach ($sv in $Global:ServicesAccountsAndSPNs) {
-        if ($selected_service -ne $sv) {
-            $svc = $sv.split(',')[0];
-            $spn = $sv.split(',')[1];
-            Write-Info "Creating $svc services account"
-            $password = ([System.Web.Security.Membership]::GeneratePassword(12,2))
-            Try { New-ADServiceAccount -Name $svc -ServicePrincipalNames "$svc/$spn.$Global:Domain" -RestrictToSingleComputer -AccountPassword (ConvertTo-SecureString $password -AsPlainText -Force) -PassThru } Catch {}
+    # FIX 5: Use regular user accounts instead of Managed Service Accounts
+    # MSAs use auto-rotated 120-char passwords and are not Kerberoastable
+    # Regular user accounts with SPNs and weak passwords ARE Kerberoastable
+    foreach ($entry in $Global:ServicesAccountsAndSPNs) {
+        $svc = $entry.split(',')[0]
+        $spn = $entry.split(',')[1]
+        $password = VulnAD-GetRandom -InputList $Global:BadPasswords
 
-        }
+        Write-Info "Kerberoasting $svc $spn"
+
+        # Remove existing MSA if present to avoid conflicts
+        Try { Remove-ADServiceAccount -Identity $svc -Confirm:$false } Catch {}
+
+        # Create as regular user account — this makes it Kerberoastable
+        Try {
+            New-ADUser -Name $svc `
+                       -SamAccountName $svc `
+                       -UserPrincipalName "$svc@$Global:Domain" `
+                       -AccountPassword (ConvertTo-SecureString $password -AsPlainText -Force) `
+                       -PasswordNeverExpires $true `
+                       -Enabled $true `
+                       -Description "Service Account"
+            # Register SPN on the user account
+            Set-ADUser $svc -ServicePrincipalNames @{Add="$svc/$spn.$Global:Domain"}
+            Write-Info "Created Kerberoastable user: $svc with SPN $svc/$spn.$Global:Domain"
+        } Catch { Write-Bad "Failed to create $svc" }
     }
+
+    # Add first service account to IT Admins to make finding more impactful
+    Try {
+        $firstSvc = $Global:ServicesAccountsAndSPNs[0].split(',')[0]
+        Add-ADGroupMember -Identity "IT Admins" -Members $firstSvc
+        Write-Info "Added $firstSvc to IT Admins"
+    } Catch {}
 }
 function VulnAD-ASREPRoasting {
-    for ($i=1; $i -le (Get-Random -Maximum 6); $i=$i+1 ) {
-        $randomuser = (VulnAD-GetRandom -InputList $Global:CreatedUsers)
-        $password = VulnAD-GetRandom -InputList $Global:BadPasswords;
-        Set-AdAccountPassword -Identity $randomuser -Reset -NewPassword (ConvertTo-SecureString $password -AsPlainText -Force)
+    # FIX 1+2+3: Guarantee minimum count and prevent duplicate user selection
+    # Original Get-Random -Maximum 6 could return as low as 1
+    # Fixed: minimum of 3, maximum of 5, unique users only
+    $min = 3
+    $max = 5
+    $count = Get-Random -Minimum $min -Maximum ($max + 1)
+
+    # FIX 2: Shuffle and slice instead of random pick — guarantees unique users
+    $selectedUsers = $Global:CreatedUsers | Get-Random -Count $count
+
+    foreach ($randomuser in $selectedUsers) {
+        $password = VulnAD-GetRandom -InputList $Global:BadPasswords
+        Set-AdAccountPassword -Identity $randomuser -Reset `
+            -NewPassword (ConvertTo-SecureString $password -AsPlainText -Force)
         Set-ADAccountControl -Identity $randomuser -DoesNotRequirePreAuth 1
         Write-Info "AS-REPRoasting $randomuser"
+
+        # Track used users to prevent other functions overwriting them
+        $Global:UsedUsers += $randomuser
     }
 }
 function VulnAD-DnsAdmins {
-    for ($i=1; $i -le (Get-Random -Maximum 6); $i=$i+1 ) {
-        $randomuser = (VulnAD-GetRandom -InputList $Global:CreatedUsers)
+    # FIX 1: Guarantee minimum of 3 DnsAdmins members
+    $count = Get-Random -Minimum 3 -Maximum 6
+
+    # FIX 2: Use unique users not already used
+    $available = $Global:CreatedUsers | Where-Object { $Global:UsedUsers -notcontains $_ }
+    $selectedUsers = $available | Get-Random -Count $count
+
+    foreach ($randomuser in $selectedUsers) {
         Add-ADGroupMember -Identity "DnsAdmins" -Members $randomuser
         Write-Info "DnsAdmins : $randomuser"
     }
@@ -161,37 +185,67 @@ function VulnAD-DnsAdmins {
     Write-Info "DnsAdmins Nested Group : $randomg"
 }
 function VulnAD-PwdInObjectDescription {
-    for ($i=1; $i -le (Get-Random -Maximum 6); $i=$i+1 ) {
-        $randomuser = (VulnAD-GetRandom -InputList $Global:CreatedUsers)
+    # FIX 1: Guarantee minimum of 3 users with passwords in description
+    # FIX 3: Only pick users not already modified by other functions
+    $count = Get-Random -Minimum 3 -Maximum 6
+
+    $available = $Global:CreatedUsers | Where-Object { $Global:UsedUsers -notcontains $_ }
+    $selectedUsers = $available | Get-Random -Count $count
+
+    foreach ($randomuser in $selectedUsers) {
         $password = ([System.Web.Security.Membership]::GeneratePassword(12,2))
-        Set-AdAccountPassword -Identity $randomuser -Reset -NewPassword (ConvertTo-SecureString $password -AsPlainText -Force)
+        Set-AdAccountPassword -Identity $randomuser -Reset `
+            -NewPassword (ConvertTo-SecureString $password -AsPlainText -Force)
         Set-ADUser $randomuser -Description "User Password $password"
         Write-Info "Password in Description : $randomuser"
+        $Global:UsedUsers += $randomuser
     }
 }
 function VulnAD-DefaultPassword {
-    for ($i=1; $i -le (Get-Random -Maximum 5); $i=$i+1 ) {
-        $randomuser = (VulnAD-GetRandom -InputList $Global:CreatedUsers)
-        $password = "Changeme123!";
-        Set-AdAccountPassword -Identity $randomuser -Reset -NewPassword (ConvertTo-SecureString $password -AsPlainText -Force)
+    # FIX 1: Guarantee minimum of 3 default password users
+    # FIX 3: Only pick users not already modified by other functions
+    $count = Get-Random -Minimum 3 -Maximum 5
+
+    $available = $Global:CreatedUsers | Where-Object { $Global:UsedUsers -notcontains $_ }
+    $selectedUsers = $available | Get-Random -Count $count
+
+    foreach ($randomuser in $selectedUsers) {
+        $password = "Changeme123!"
+        Set-AdAccountPassword -Identity $randomuser -Reset `
+            -NewPassword (ConvertTo-SecureString $password -AsPlainText -Force)
         Set-ADUser $randomuser -Description "New User ,DefaultPassword"
         Set-AdUser $randomuser -ChangePasswordAtLogon $true
         Write-Info "Default Password : $randomuser"
+        $Global:UsedUsers += $randomuser
     }
 }
 function VulnAD-PasswordSpraying {
-    $same_password = "ncc1701";
-    for ($i=1; $i -le (Get-Random -Maximum 12); $i=$i+1 ) {
-        $randomuser = (VulnAD-GetRandom -InputList $Global:CreatedUsers)
-        Set-AdAccountPassword -Identity $randomuser -Reset -NewPassword (ConvertTo-SecureString $same_password -AsPlainText -Force)
+    # FIX 1: Guarantee minimum of 8 spray victims
+    # FIX 3: Only pick users not already modified by other functions
+    $same_password = "ncc1701"
+    $count = Get-Random -Minimum 8 -Maximum 12
+
+    $available = $Global:CreatedUsers | Where-Object { $Global:UsedUsers -notcontains $_ }
+    $selectedUsers = $available | Get-Random -Count $count
+
+    foreach ($randomuser in $selectedUsers) {
+        Set-AdAccountPassword -Identity $randomuser -Reset `
+            -NewPassword (ConvertTo-SecureString $same_password -AsPlainText -Force)
         Set-ADUser $randomuser -Description "Shared User"
         Write-Info "Same Password (Password Spraying) : $randomuser"
+        $Global:UsedUsers += $randomuser
     }
 }
 function VulnAD-DCSync {
-    for ($i=1; $i -le (Get-Random -Maximum 6); $i=$i+1 ) {
+    # FIX 1: Guarantee minimum of 3 DCSync users
+    # FIX 3: Only pick users not already modified by other functions
+    $count = Get-Random -Minimum 3 -Maximum 6
+
+    $available = $Global:CreatedUsers | Where-Object { $Global:UsedUsers -notcontains $_ }
+    $selectedUsers = $available | Get-Random -Count $count
+
+    foreach ($randomuser in $selectedUsers) {
         $ADObject = [ADSI]("LDAP://" + (Get-ADDomain $Global:Domain).DistinguishedName)
-        $randomuser = (VulnAD-GetRandom -InputList $Global:CreatedUsers)
         $sid = (Get-ADUser -Identity $randomuser).sid
 
         $objectGuidGetChanges = New-Object Guid 1131f6aa-9c07-11d1-f79f-00c04fc2dcd2
@@ -209,10 +263,105 @@ function VulnAD-DCSync {
 
         Set-ADUser $randomuser -Description "Replication Account"
         Write-Info "Giving DCSync to : $randomuser"
+        $Global:UsedUsers += $randomuser
     }
 }
 function VulnAD-DisableSMBSigning {
-    Set-SmbClientConfiguration -RequireSecuritySignature 0 -EnableSecuritySignature 0 -Confirm -Force
+    # FIX 4: Original only disabled CLIENT signing
+    # Added SERVER signing and registry keys for persistence
+
+    # Client side
+    Set-SmbClientConfiguration -RequireSecuritySignature 0 `
+                                -EnableSecuritySignature 0 `
+                                -Confirm:$false -Force
+
+    # Server side — this is what was missing
+    Set-SmbServerConfiguration -RequireSecuritySignature 0 `
+                                -EnableSecuritySignature 0 `
+                                -Confirm:$false -Force
+
+    # Registry for persistence across reboots
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters" `
+                     -Name "RequireSecuritySignature" -Value 0 -Type DWord
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters" `
+                     -Name "EnableSecuritySignature" -Value 0 -Type DWord
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters" `
+                     -Name "RequireSecuritySignature" -Value 0 -Type DWord
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters" `
+                     -Name "EnableSecuritySignature" -Value 0 -Type DWord
+
+    # Enable null sessions for anonymous enumeration
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" `
+                     -Name "RestrictAnonymous" -Value 0 -Type DWord
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" `
+                     -Name "RestrictAnonymousSAM" -Value 0 -Type DWord
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" `
+                     -Name "EveryoneIncludesAnonymous" -Value 1 -Type DWord
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters" `
+                     -Name "NullSessionPipes" `
+                     -Value @("BROWSER","SRVSVC","WKSSVC","SAMR","LSARPC","NETLOGON") `
+                     -Type MultiString
+    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\LanManServer\Parameters" `
+                     -Name "NullSessionShares" `
+                     -Value @("IPC$","SYSVOL","NETLOGON") `
+                     -Type MultiString
+
+    Restart-Service LanmanServer -Force
+    Write-Info "SMB Signing disabled on both client and server"
+    Write-Info "Null sessions enabled"
+}
+function VulnAD-ITAdminsDomainAdminPath {
+    # FIX 6: Original script creates no escalation path from custom groups
+    # to built-in privileged groups like Domain Admins.
+    # The ACL chain stops at IT Admins with no link to Domain Admins.
+    #
+    # This function grants GenericAll from IT Admins via AdminSDHolder —
+    # a realistic misconfiguration where IT staff are over-privileged,
+    # creating a full persistent attack chain:
+    #
+    # Normal group  →  ACL abuse  →  Mid group
+    # Mid group     →  ACL abuse  →  IT Admins
+    # IT Admins     →  GenericAll →  Domain Admins  ← this function adds this
+    # Domain Admins →  owns       →  entire domain
+    #
+    # WHY AdminSDHolder instead of Domain Admins directly:
+    # AD runs a process called SDProp every 60 minutes that resets ACLs
+    # on all protected groups (Domain Admins, Administrators etc.) back
+    # to a default template stored in AdminSDHolder. Setting the ACE on
+    # Domain Admins directly means SDProp wipes it every 60 minutes.
+    # Setting it on AdminSDHolder means SDProp actively propagates our
+    # ACE to Domain Admins every 60 minutes — making it persistent.
+
+    Try {
+        $ITAdmins = Get-ADGroup -Identity "IT Admins"
+
+        # Explicitly construct SecurityIdentifier from SID value
+        # Using $ITAdmins.SID directly can fail — casting to SecurityIdentifier
+        # ensures the ACE is built with a valid principal reference
+        $sid = New-Object System.Security.Principal.SecurityIdentifier($ITAdmins.SID)
+
+        # Target AdminSDHolder instead of Domain Admins directly
+        # SDProp will propagate this ACE to all protected groups every 60 minutes
+        $domainDN = (Get-ADDomain).DistinguishedName
+        $adminSDHolder = "CN=AdminSDHolder,CN=System,$domainDN"
+        $ADObject = [ADSI]("LDAP://$adminSDHolder")
+
+        $adRights = [System.DirectoryServices.ActiveDirectoryRights]"GenericAll"
+        $type = [System.Security.AccessControl.AccessControlType]"Allow"
+        $inheritanceType = [System.DirectoryServices.ActiveDirectorySecurityInheritance]"All"
+        $ACE = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($sid, $adRights, $type, $inheritanceType)
+        $ADObject.psbase.ObjectSecurity.AddAccessRule($ACE)
+        $ADObject.psbase.CommitChanges()
+
+        # Trigger SDProp immediately so ACE propagates to Domain Admins
+        # without waiting for the default 60 minute cycle
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Services\NTDS\Parameters"
+        Set-ItemProperty -Path $key -Name "RunProtectAdminGroupsTask" -Value 1 -Type DWord
+
+        Write-Info "GenericAll set on AdminSDHolder for IT Admins — will persist across SDProp cycles"
+    } Catch {
+        Write-Bad "Failed to set AdminSDHolder ACL for IT Admins: $_"
+    }
 }
 function Invoke-VulnAD {
     Param(
@@ -224,7 +373,17 @@ function Invoke-VulnAD {
     )
     ShowBanner
     $Global:Domain = $DomainName
-    Set-ADDefaultDomainPasswordPolicy -Identity $Global:Domain -LockoutDuration 00:01:00 -LockoutObservationWindow 00:01:00 -ComplexityEnabled $false -ReversibleEncryptionEnabled $False -MinPasswordLength 4
+
+    # FIX 2: Initialise UsedUsers tracking list — prevents functions
+    # from overwriting each other's vulnerability configurations
+    $Global:UsedUsers = @()
+
+    Set-ADDefaultDomainPasswordPolicy -Identity $Global:Domain `
+        -LockoutDuration 00:01:00 `
+        -LockoutObservationWindow 00:01:00 `
+        -ComplexityEnabled $false `
+        -ReversibleEncryptionEnabled $False `
+        -MinPasswordLength 4
     VulnAD-AddADUser -limit $UsersLimit
     Write-Good "Users Created"
     VulnAD-AddADGroup -GroupList $Global:HighGroups
@@ -235,6 +394,8 @@ function Invoke-VulnAD {
     Write-Good "$Global:NormalGroups Groups Created"
     VulnAD-BadAcls
     Write-Good "BadACL Done"
+    VulnAD-ITAdminsDomainAdminPath
+    Write-Good "IT Admins -> Domain Admins Path Created"
     VulnAD-Kerberoasting
     Write-Good "Kerberoasting Done"
     VulnAD-ASREPRoasting
@@ -250,5 +411,5 @@ function Invoke-VulnAD {
     VulnAD-DCSync
     Write-Good "DCSync Done"
     VulnAD-DisableSMBSigning
-    Write-Good "SMB Signing Disabled"
+    Write-Good "SMB Signing Disabled on Client and Server"
 }
