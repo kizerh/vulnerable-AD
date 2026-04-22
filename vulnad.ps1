@@ -110,6 +110,8 @@ function VulnAD-BadAcls {
     }
     for ($i=1; $i -le (Get-Random -Maximum 25); $i=$i+1 ) {
         $abuse = (VulnAD-GetRandom -InputList $Global:BadACL);
+    }
+}
 function VulnAD-Kerberoasting {
     # FIX 5: Use regular user accounts instead of Managed Service Accounts
     # MSAs use auto-rotated 120-char passwords and are not Kerberoastable
